@@ -36,6 +36,69 @@ const OUTPUT_FILE = path.join(
   "data",
   "update-churn.json",
 );
+
+/**
+ * Sidecar cache of per-tag build times, written next to the churn cache and
+ * aged by its own `generatedAt`. The packages API has a low per-hour limit and
+ * an all-or-nothing contract: a rate-limited run currently returns `{}` and the
+ * whole same-day chain falls back to non-chronological tag-text order. Keeping
+ * the previous complete crawl lets a flaky run degrade to yesterday's ordering
+ * instead of flapping run-to-run.
+ */
+const CREATED_AT_CACHE_FILE = path.join(
+  __dirname,
+  "..",
+  "static",
+  "data",
+  "update-churn-createdat.json",
+);
+
+/**
+ * Read the build-time sidecar cache. Returns `{}` when the file is missing,
+ * unreadable, undated, or older than the cache window — all of which mean
+ * "no reliable build times". Aged by the payload's own `generatedAt`, the same
+ * checkout-proof signal `seed-cache.js` uses for the other committed seeds.
+ */
+function loadCreatedAtCache(file = CREATED_AT_CACHE_FILE) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+    const stamp = Date.parse(parsed?.generatedAt ?? "");
+    const ageMs = Number.isFinite(stamp) ? Date.now() - stamp : Infinity;
+    if (
+      parsed &&
+      typeof parsed.tags === "object" &&
+      parsed.tags !== null &&
+      ageMs < CACHE_MAX_AGE_HOURS * 3_600_000
+    ) {
+      return parsed.tags;
+    }
+  } catch {
+    // missing / unreadable / undated — treated as empty
+  }
+  return {};
+}
+
+/**
+ * Persist a complete build-time crawl to the sidecar cache. Only complete
+ * crawls are written: a partial snapshot would mix build-time and tag-text
+ * ordering on a later run, so a rate-limited crawl is discarded rather than
+ * cached.
+ */
+function saveCreatedAtCache(map, file = CREATED_AT_CACHE_FILE) {
+  try {
+    fs.writeFileSync(
+      file,
+      JSON.stringify(
+        { generatedAt: new Date().toISOString(), tags: map },
+        null,
+        2,
+      ) + "\n",
+      "utf8",
+    );
+  } catch {
+    // ignore — the in-run crawl is the source of truth when the API works
+  }
+}
 const SBOM_FILE = path.join(
   __dirname,
   "..",
@@ -419,15 +482,22 @@ async function getPlatformLayers(repo, tag) {
  * and the tags pointing at it, which is exactly the ordering signal the churn
  * series needs.
  *
- * Returns `{}` — never throws — when the API is unreachable, unauthenticated or
- * rate-limited. `compareTagsByDate` then falls back to tag text, which is a
- * documented approximation, not a crash.
+ * Returns a tag -> build-time map — never throws — when the API is
+ * unreachable, unauthenticated or rate-limited. On failure it falls back to
+ * the previous complete crawl (see `CREATED_AT_CACHE_FILE`), so `compareTagsByDate`
+ * keeps ordering same-day tags by build time instead of flapping to non-chrono-
+ * logical tag text run-to-run. Only a missing token or a never-run cache yields
+ * `{}`, and then it degrades to tag text as a documented approximation.
  *
+ * @param {string} [cacheFile] sidecar cache path, overridable for tests
  * @returns {Promise<Record<string, string>>} tag -> ISO 8601 build timestamp
  */
-async function fetchGhcrTagCreatedAt(org, pkg, maxPages = 2) {
+async function fetchGhcrTagCreatedAt(
+  org,
+  pkg,
+  cacheFile = CREATED_AT_CACHE_FILE,
+) {
   const token = githubToken();
-  const createdAt = {};
   if (!token) {
     // #1434 asks for a warning on the no-token path (not just the 403 catch),
     // so a run without GITHUB_TOKEN surfaces the gap instead of silently
@@ -437,9 +507,15 @@ async function fetchGhcrTagCreatedAt(org, pkg, maxPages = 2) {
         "timestamps unavailable; falling back to tag-text ordering within a day. " +
         "Set GITHUB_TOKEN (with packages read access) to read per-tag build times.",
     );
-    return createdAt;
+    return {};
   }
-  if (!org || !pkg) return createdAt;
+  if (!org || !pkg) return {};
+
+  // Reuse the previous complete crawl first. The packages API has a low
+  // per-hour limit and an all-or-nothing contract here: a rate-limited run
+  // used to return {} and the whole same-day chain fell back to tag text,
+  // flapping run-to-run. Yesterday's build times keep the chain chronological.
+  const cached = loadCreatedAtCache(cacheFile);
 
   const headers = {
     Authorization: `Bearer ${token}`,
@@ -449,14 +525,18 @@ async function fetchGhcrTagCreatedAt(org, pkg, maxPages = 2) {
   };
 
   try {
+    // Paginate the whole package instead of a fixed window: a tag dropped by a
+    // page cap would have no build time and fall back to tag text, which is the
+    // non-chronological ordering the cache is meant to remove.
+    let fresh = {};
     let url =
       `https://api.github.com/orgs/${org}/packages/container/` +
       `${encodeURIComponent(pkg)}/versions?per_page=100`;
-    for (let page = 0; url && page < maxPages; page += 1) {
+    for (let page = 0; url; page += 1) {
       const res = await fetch(url, { headers });
       if (!res.ok) {
         // 404 = package unknown to the API, 403 = scope or rate limit. Either
-        // way the caller keeps working with the text tie-break.
+        // way the caller keeps working with the cached tie-break.
         throw new Error(`HTTP ${res.status}`);
       }
       const versions = await res.json();
@@ -469,23 +549,25 @@ async function fetchGhcrTagCreatedAt(org, pkg, maxPages = 2) {
           // The API lists versions newest-first and a tag can survive more
           // than one version, so the first hit is the newest build carrying
           // the name — which is the manifest the tag resolves to today.
-          if (typeof tag === "string" && !createdAt[tag])
-            createdAt[tag] = built;
+          if (typeof tag === "string" && !fresh[tag]) fresh[tag] = built;
         }
       }
       url =
         res.headers.get("link")?.match(/<([^>]+)>;\s*rel="next"/i)?.[1] || null;
       if (url) url = new URL(url, res.url).href;
     }
+    // Persist only a complete crawl. A partial snapshot would mix build-time
+    // and tag-text ordering on a later run, so a rate-limited crawl is
+    // discarded rather than cached.
+    saveCreatedAtCache(fresh, cacheFile);
+    return fresh;
   } catch (err) {
     console.warn(
       `fetch-update-churn: build timestamps unavailable for ${org}/${pkg} — ` +
-        `${err.message}; falling back to tag-text ordering within a day`,
+        `${err.message}; falling back to cached build times`,
     );
-    return {};
+    return cached;
   }
-
-  return createdAt;
 }
 
 /**
@@ -710,6 +792,8 @@ module.exports = {
   selectDatedTags,
   discoverSeriesTags,
   fetchGhcrTagCreatedAt,
+  loadCreatedAtCache,
+  saveCreatedAtCache,
   extractDateFromTag,
   fetchGhcrManifest,
   getPlatformLayers,

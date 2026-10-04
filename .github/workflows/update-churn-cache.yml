@@ -65,6 +65,13 @@ jobs:
           BRANCH="chore/update-churn-$(date +%Y%m%d)"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          # Persist the build-time sidecar cache so a rate-limited run next day
+          # falls back to yesterday's ordering instead of flapping to tag text
+          # (#1471). Only the churn payload drives change detection above, so
+          # this is staged here, not in the check-changes step.
+          if [ -f static/data/update-churn-createdat.json ]; then
+            git add static/data/update-churn-createdat.json
+          fi
           git checkout -b "$BRANCH"
           git commit -m "chore(analytics): update release churn statistics"
           git push -u origin "$BRANCH" --force

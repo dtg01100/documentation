@@ -1,5 +1,8 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
 
 const {
   analyzeManifestLayers,
@@ -10,6 +13,8 @@ const {
   compareTagsByDate,
   selectDatedTags,
   fetchGhcrTagCreatedAt,
+  loadCreatedAtCache,
+  saveCreatedAtCache,
 } = require("./fetch-update-churn.js");
 
 test("analyzeManifestLayers: handles empty or invalid layers safely", () => {
@@ -416,4 +421,175 @@ test("fetchGhcrTagCreatedAt: warns and returns {} on the no-token path (#1434)",
     if (savedGh === undefined) delete process.env.GH_TOKEN;
     else process.env.GH_TOKEN = savedGh;
   }
+});
+
+// ── build-time sidecar cache (regression: #1471) ────────────────────────────
+// A same-day chain only orders chronologically when build times are available.
+// The packages API is rate-limited and all-or-nothing, so a failed run used to
+// return {} and the whole chain flapped to non-chronological tag text. The
+// sidecar cache keeps the previous complete crawl so ordering stays stable.
+
+function writeTempCache(tags, { ageHours = 0 } = {}) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "churn-createdat-"));
+  const file = path.join(dir, "createdat.json");
+  const stamp = new Date(Date.now() - ageHours * 3_600_000).toISOString();
+  fs.writeFileSync(
+    file,
+    JSON.stringify({ generatedAt: stamp, tags }, null, 2) + "\n",
+    "utf8",
+  );
+  return file;
+}
+
+function mockFetch(responses) {
+  // responses: array of { ok, status, json, link } or a function(url)
+  const calls = [];
+  global.fetch = async (url) => {
+    calls.push(url);
+    const idx = Math.min(calls.length - 1, responses.length - 1);
+    const r = typeof responses === "function" ? responses(url) : responses[idx];
+    return {
+      ok: r.ok !== false && r.status !== 403 && r.status !== 500,
+      status: r.status || 200,
+      url,
+      headers: {
+        get: (h) => (h.toLowerCase() === "link" ? r.link || null : null),
+      },
+      json: async () => r.body,
+    };
+  };
+  return calls;
+}
+
+test("loadCreatedAtCache: returns {} for a missing, undated, or stale file", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "churn-createdat-"));
+  try {
+    assert.deepEqual(loadCreatedAtCache(path.join(dir, "missing.json")), {});
+    const undated = path.join(dir, "undated.json");
+    fs.writeFileSync(undated, JSON.stringify({ tags: { a: "b" } }), "utf8");
+    assert.deepEqual(loadCreatedAtCache(undated), {});
+    const stale = writeTempCache({ a: "b" }, { ageHours: 48 });
+    assert.deepEqual(loadCreatedAtCache(stale), {});
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("loadCreatedAtCache: returns the tags of a fresh cache", () => {
+  const file = writeTempCache({
+    "testing-20261003-aaaaaaa": "2026-10-03T01:00:00Z",
+  });
+  try {
+    assert.deepEqual(loadCreatedAtCache(file), {
+      "testing-20261003-aaaaaaa": "2026-10-03T01:00:00Z",
+    });
+  } finally {
+    fs.rmSync(file, { force: true });
+  }
+});
+
+test("saveCreatedAtCache then loadCreatedAtCache round-trips", () => {
+  const file = writeTempCache({});
+  try {
+    const tags = { "testing-20261003-bbbbbbb": "2026-10-03T02:00:00Z" };
+    saveCreatedAtCache(tags, file);
+    assert.deepEqual(loadCreatedAtCache(file), tags);
+  } finally {
+    fs.rmSync(file, { force: true });
+  }
+});
+
+test("fetchGhcrTagCreatedAt: keeps the previous crawl when the API fails (#1471)", async () => {
+  const savedToken = process.env.GITHUB_TOKEN;
+  process.env.GITHUB_TOKEN = "test-token";
+  const cached = {
+    "testing-20261003-f7c24b2": "2026-10-03T09:41:52Z",
+    "testing-20261003-b0d302a": "2026-10-03T18:04:11Z",
+  };
+  const file = writeTempCache(cached);
+  const calls = mockFetch(() => ({ status: 403, body: [] }));
+  try {
+    const result = await fetchGhcrTagCreatedAt("projectbluefin", "utah", file);
+    // Falls back to the cached crawl instead of returning {} — same-day order
+    // stays chronological and does not flap to tag text.
+    assert.deepEqual(result, cached);
+    // A failed crawl is never written, so the cache still holds the good run.
+    const after = JSON.parse(fs.readFileSync(file, "utf8"));
+    assert.deepEqual(after.tags, cached);
+    // It still tried the API — this is a fallback, not a skip.
+    assert.ok(calls.length > 0);
+  } finally {
+    global.fetch = undefined;
+    fs.rmSync(file, { force: true });
+    if (savedToken === undefined) delete process.env.GITHUB_TOKEN;
+    else process.env.GITHUB_TOKEN = savedToken;
+  }
+});
+
+test("fetchGhcrTagCreatedAt: persists a complete crawl to the cache", async () => {
+  const savedToken = process.env.GITHUB_TOKEN;
+  process.env.GITHUB_TOKEN = "test-token";
+  const file = writeTempCache({});
+  const calls = mockFetch([
+    {
+      status: 200,
+      link: '<https://api.github.com/next>; rel="next"',
+      body: [
+        {
+          created_at: "2026-10-03T09:41:52Z",
+          metadata: { container: { tags: ["testing-20261003-f7c24b2"] } },
+        },
+      ],
+    },
+    {
+      status: 200,
+      link: null,
+      body: [
+        {
+          created_at: "2026-10-03T18:04:11Z",
+          metadata: { container: { tags: ["testing-20261003-b0d302a"] } },
+        },
+      ],
+    },
+  ]);
+  try {
+    const result = await fetchGhcrTagCreatedAt("projectbluefin", "utah", file);
+    assert.deepEqual(result, {
+      "testing-20261003-f7c24b2": "2026-10-03T09:41:52Z",
+      "testing-20261003-b0d302a": "2026-10-03T18:04:11Z",
+    });
+    // Two pages were crawled, and the complete crawl was cached.
+    assert.equal(calls.length, 2);
+    const after = JSON.parse(fs.readFileSync(file, "utf8"));
+    assert.deepEqual(after.tags, result);
+  } finally {
+    global.fetch = undefined;
+    fs.rmSync(file, { force: true });
+    if (savedToken === undefined) delete process.env.GITHUB_TOKEN;
+    else process.env.GITHUB_TOKEN = savedToken;
+  }
+});
+
+// ── regression anchor: #1471 same-day ordering ──────────────────────────────
+// The reported bug is that same-day testing tags flip between build-time order
+// and tag-text order run-to-run because build times were unavailable. This
+// proves the tie-break is build time (not tag text); the cache test above proves
+// build times are now reliably returned on a flaky run, so this order holds.
+
+test("selectDatedTags: orders same-day tags by build time, not tag text (#1471)", () => {
+  // Tag-text order puts aaaaaaa before bbbbbbb; build-time order is the
+  // OPPOSITE, so this can only pass if the tie-break is build time.
+  const tags = ["testing-20261003-aaaaaaa", "testing-20261003-bbbbbbb"];
+  const series = {
+    pattern: /^testing-\d{8}-[0-9a-f]{7}$/,
+    limit: 5,
+  };
+  const createdAt = {
+    "testing-20261003-aaaaaaa": "2026-10-03T18:00:00Z",
+    "testing-20261003-bbbbbbb": "2026-10-03T09:00:00Z",
+  };
+  assert.deepEqual(selectDatedTags(tags, series, createdAt), [
+    "testing-20261003-bbbbbbb",
+    "testing-20261003-aaaaaaa",
+  ]);
 });
