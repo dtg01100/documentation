@@ -68,7 +68,7 @@ function loadCreatedAtCache(file = CREATED_AT_CACHE_FILE) {
       parsed &&
       typeof parsed.tags === "object" &&
       parsed.tags !== null &&
-      ageMs < CACHE_MAX_AGE_HOURS * 3_600_000
+      ageMs < CREATED_AT_CACHE_MAX_HOURS * 3_600_000
     ) {
       return parsed.tags;
     }
@@ -108,6 +108,18 @@ const SBOM_FILE = path.join(
 );
 
 const CACHE_MAX_AGE_HOURS = Number(process.env.UPDATE_CHURN_CACHE_HOURS || 24);
+
+// The build-time sidecar cache ages on its OWN, longer window, independent of
+// the 24h churn-payload freshness window above. The workflow that writes it is
+// a daily cron (`0 5 * * *`), and the last four scheduled runs started 05:17,
+// 05:16, 05:15, 06:56 UTC — 3 of 4 consecutive gaps exceed 24h on a
+// rate-limited run. If the sidecar shared the 24h window, yesterday's complete
+// crawl is treated as stale exactly when it is most needed, the lookup returns
+// {}, and the same-day chain flaps to non-chronological tag text (the symptom
+// in #1471). Seven days tolerates a missed/late run and a rate-limited one.
+const CREATED_AT_CACHE_MAX_HOURS = Number(
+  process.env.UPDATE_CHURN_CREATEDAT_CACHE_HOURS || 168,
+);
 const FORCE_REFRESH = process.argv.includes("--force");
 
 /**
@@ -783,6 +795,7 @@ module.exports = {
   OUTPUT_FILE,
   SBOM_FILE,
   CACHE_MAX_AGE_HOURS,
+  CREATED_AT_CACHE_MAX_HOURS,
   IMAGE_CONFIGS,
   analyzeManifestLayers,
   diffReleaseLayers,

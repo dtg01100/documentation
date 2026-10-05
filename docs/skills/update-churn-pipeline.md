@@ -51,6 +51,24 @@ Measuring release-over-release download deltas, chunkah layer reuse efficiency, 
      dataset **must** pass `GITHUB_TOKEN` to the compute step — without one
      `fetchGhcrTagCreatedAt` returns `{}` and the sort silently degrades to tag
      text, which is the failure this tie-break exists to prevent.
+   - **The build-time lookup is cached in a committed sidecar.**
+     `fetchGhcrTagCreatedAt` writes the whole per-tag crawl to
+     `static/data/update-churn-createdat.json` (aged by its own `generatedAt`,
+     the same checkout-proof signal `seed-cache.js` uses for the other seeds).
+     The packages API is rate-limited and all-or-nothing, so a failed or
+     rate-limited run returns `{}` — the sidecar lets the next run fall back to
+     yesterday's complete crawl instead of flapping to non-chronological tag
+     text (regression #1471). Only a *complete* crawl is written; a partial
+     snapshot is discarded so it never mixes build-time and tag-text ordering.
+     The sidecar ages on its OWN window (`CREATED_AT_CACHE_MAX_HOURS`, default
+     168h / 7 days), independent of the 24h churn-payload freshness window: the
+     workflow that writes it is a daily cron that has started late past 24h on
+     rate-limited runs, so a shorter window would treat the useful yesterday's
+     crawl as stale exactly when it is most needed. **The sidecar file is
+     explicitly allow-listed in `.gitignore`** (the parent `/static/data/*.json`
+     ignore would otherwise discard it, and the workflow `git add`s it
+     explicitly) — without the allow-list the sidecar is never committed and
+     the tie-break is lost after a checkout.
    - **An undated tag sorts last, never first.** A tag carrying no `YYYYMMDD`
      is a floating name (`stable`, `testing`) pointing at the newest manifest,
      so it belongs at the end of any series it is part of. Sorting it first
@@ -158,6 +176,11 @@ Measuring release-over-release download deltas, chunkah layer reuse efficiency, 
 - `npm run typecheck` passes with 0 errors.
 - `npm run lint` passes with 0 errors.
 - `static/data/update-churn.json` carries a valid `generatedAt` timestamp and contains entries for all three images (`bluefin`, `dakota`, `utah`).
+- `static/data/update-churn-createdat.json` is committed (not gitignored) and
+  its `.gitignore` allow-list entry exists, so the build-time sidecar survives
+  a checkout. `node --test scripts/fetch-update-churn.test.js` covers the
+  aging boundary: a cache older than the 24h churn window but within 7 days is
+  still fresh, and one past 7 days is treated as stale.
 
 ## Sources
 
@@ -169,3 +192,4 @@ Measuring release-over-release download deltas, chunkah layer reuse efficiency, 
 - `projectbluefin/lab` → `src/scripts/{tests-charts.js,builds-charts.js}`, the
   house chart style these panels follow
 - `.github/workflows/update-churn-cache.yml`
+- `scripts/fetch-update-churn.js` (build-time sidecar: `update-churn-createdat.json`)

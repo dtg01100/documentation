@@ -468,13 +468,42 @@ test("loadCreatedAtCache: returns {} for a missing, undated, or stale file", () 
     const undated = path.join(dir, "undated.json");
     fs.writeFileSync(undated, JSON.stringify({ tags: { a: "b" } }), "utf8");
     assert.deepEqual(loadCreatedAtCache(undated), {});
-    const stale = writeTempCache({ a: "b" }, { ageHours: 48 });
+    const stale = writeTempCache({ a: "b" }, { ageHours: 200 });
     assert.deepEqual(loadCreatedAtCache(stale), {});
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 
+test("loadCreatedAtCache: a cache older than the 24h churn window is still fresh", () => {
+  // Regression anchor for #1472: the sidecar ages on its own 7-day window
+  // (CREATED_AT_CACHE_MAX_HOURS), independent of the 24h churn-payload window.
+  // A daily cron starts late on rate-limited runs (gaps past 24h observed), so
+  // a 100h-old complete crawl must still be used, not treated as stale.
+  const file = writeTempCache(
+    { "testing-20261003-ccccccc": "2026-10-03T01:00:00Z" },
+    { ageHours: 100 },
+  );
+  try {
+    assert.deepEqual(loadCreatedAtCache(file), {
+      "testing-20261003-ccccccc": "2026-10-03T01:00:00Z",
+    });
+  } finally {
+    fs.rmSync(file, { force: true });
+  }
+});
+
+test("loadCreatedAtCache: returns {} only past the 7-day sidecar window", () => {
+  const file = writeTempCache(
+    { "testing-20261003-ddddddd": "2026-10-03T01:00:00Z" },
+    { ageHours: 200 },
+  );
+  try {
+    assert.deepEqual(loadCreatedAtCache(file), {});
+  } finally {
+    fs.rmSync(file, { force: true });
+  }
+});
 test("loadCreatedAtCache: returns the tags of a fresh cache", () => {
   const file = writeTempCache({
     "testing-20261003-aaaaaaa": "2026-10-03T01:00:00Z",
