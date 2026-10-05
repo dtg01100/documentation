@@ -251,6 +251,41 @@ test("compareTagsByDate: orders by date, then build time, then tag text", () => 
   );
 });
 
+test("compareTagsByDate: same-day tags without a build time rank after known ones", () => {
+  // A cached crawl from before later same-day builds covers only some tags.
+  // Unknown tags must rank consistently after known ones (a total order), not
+  // be compared by tag text against some and by build time against others.
+  const createdAt = {
+    "testing-20261003-f7c24b2": "2026-10-03T18:04:11Z",
+    "testing-20261003-b0d302a": "2026-10-03T09:41:52Z",
+  };
+  const tags = [
+    "testing-20261003-0000001",
+    "testing-20261003-f7c24b2",
+    "testing-20261002-zzzzzzz",
+    "testing-20261003-b0d302a",
+    "testing-20261003-aaaaaaa",
+  ];
+  const expected = [
+    "testing-20261002-zzzzzzz",
+    "testing-20261003-b0d302a",
+    "testing-20261003-f7c24b2",
+    "testing-20261003-0000001",
+    "testing-20261003-aaaaaaa",
+  ];
+  const cmp = (a, b) => compareTagsByDate(a, b, createdAt);
+  assert.deepEqual([...tags].sort(cmp), expected);
+  assert.deepEqual([...tags].reverse().sort(cmp), expected);
+  assert.equal(
+    cmp("testing-20261003-0000001", "testing-20261003-f7c24b2") > 0,
+    true,
+  );
+  assert.equal(
+    cmp("testing-20261003-f7c24b2", "testing-20261003-0000001") < 0,
+    true,
+  );
+});
+
 test("compareTagsByDate: an undated floating tag sorts last, not first", () => {
   // `stable` is Bluefin's floating tag: it names whatever the newest manifest
   // is, so it is the end of the series. Sorting it first would make it the
@@ -441,6 +476,8 @@ function writeTempCache(tags, { ageHours = 0 } = {}) {
   return file;
 }
 
+const nativeFetch = global.fetch;
+
 function mockFetch(responses) {
   // responses: array of { ok, status, json, link } or a function(url)
   const calls = [];
@@ -548,7 +585,7 @@ test("fetchGhcrTagCreatedAt: keeps the previous crawl when the API fails (#1471)
     // It still tried the API — this is a fallback, not a skip.
     assert.ok(calls.length > 0);
   } finally {
-    global.fetch = undefined;
+    global.fetch = nativeFetch;
     fs.rmSync(file, { force: true });
     if (savedToken === undefined) delete process.env.GITHUB_TOKEN;
     else process.env.GITHUB_TOKEN = savedToken;
@@ -592,7 +629,7 @@ test("fetchGhcrTagCreatedAt: persists a complete crawl to the cache", async () =
     const after = JSON.parse(fs.readFileSync(file, "utf8"));
     assert.deepEqual(after.tags, result);
   } finally {
-    global.fetch = undefined;
+    global.fetch = nativeFetch;
     fs.rmSync(file, { force: true });
     if (savedToken === undefined) delete process.env.GITHUB_TOKEN;
     else process.env.GITHUB_TOKEN = savedToken;
@@ -621,4 +658,23 @@ test("selectDatedTags: orders same-day tags by build time, not tag text (#1471)"
     "testing-20261003-bbbbbbb",
     "testing-20261003-aaaaaaa",
   ]);
+});
+
+test("fetchGhcrTagCreatedAt: an empty successful crawl keeps the previous cache", async () => {
+  const savedToken = process.env.GITHUB_TOKEN;
+  process.env.GITHUB_TOKEN = "test-token";
+  const cached = { "testing-20261003-f7c24b2": "2026-10-03T09:41:52Z" };
+  const file = writeTempCache(cached);
+  mockFetch([{ status: 200, link: null, body: [] }]);
+  try {
+    const result = await fetchGhcrTagCreatedAt("projectbluefin", "utah", file);
+    assert.deepEqual(result, cached);
+    const after = JSON.parse(fs.readFileSync(file, "utf8"));
+    assert.deepEqual(after.tags, cached);
+  } finally {
+    global.fetch = nativeFetch;
+    fs.rmSync(file, { force: true });
+    if (savedToken === undefined) delete process.env.GITHUB_TOKEN;
+    else process.env.GITHUB_TOKEN = savedToken;
+  }
 });

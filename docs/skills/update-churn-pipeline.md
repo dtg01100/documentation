@@ -58,8 +58,12 @@ Measuring release-over-release download deltas, chunkah layer reuse efficiency, 
      The packages API is rate-limited and all-or-nothing, so a failed or
      rate-limited run returns `{}` — the sidecar lets the next run fall back to
      yesterday's complete crawl instead of flapping to non-chronological tag
-     text (regression #1471). Only a *complete* crawl is written; a partial
-     snapshot is discarded so it never mixes build-time and tag-text ordering.
+     text (regression #1471). Only a _complete, non-empty_ crawl is written; a
+     partial or empty crawl is discarded so it never overwrites a good one.
+     Tags built after the cached crawl (or after the last merged chore PR that
+     committed it) have no build time; `compareTagsByDate` ranks them after
+     every same-day tag that has one, so the order stays a consistent total
+     order and those newer builds still land last.
      The sidecar ages on its OWN window (`CREATED_AT_CACHE_MAX_HOURS`, default
      168h / 7 days), independent of the 24h churn-payload freshness window: the
      workflow that writes it is a daily cron that has started late past 24h on

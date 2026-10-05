@@ -263,7 +263,8 @@ function datedTagKey(tag = "") {
  * same-day pair compared in the wrong direction reports different numbers than
  * the one a user actually performs. Tag text is not a build time — `362ea44`
  * sorts before `815ea44` while being the newer build — so it is the last
- * resort, used only for tags the packages API had no `created_at` for.
+ * resort, used only for tags the packages API had no `created_at` for; such
+ * tags rank after every same-day tag that has a build time.
  *
  * @param {string} a
  * @param {string} b
@@ -277,6 +278,10 @@ function compareTagsByDate(a, b, createdAt = {}) {
   if (dateDelta !== 0) return dateDelta;
   const builtA = createdAt?.[a];
   const builtB = createdAt?.[b];
+  // A same-day tag with no build time ranks after every tag that has one, so
+  // the comparator stays a total order when only part of the day is known
+  // (e.g. a cached crawl that predates later builds, which are newer anyway).
+  if (!builtA !== !builtB) return builtA ? -1 : 1;
   if (builtA && builtB && builtA !== builtB) {
     return String(builtA).localeCompare(String(builtB));
   }
@@ -568,9 +573,10 @@ async function fetchGhcrTagCreatedAt(
         res.headers.get("link")?.match(/<([^>]+)>;\s*rel="next"/i)?.[1] || null;
       if (url) url = new URL(url, res.url).href;
     }
-    // Persist only a complete crawl. A partial snapshot would mix build-time
-    // and tag-text ordering on a later run, so a rate-limited crawl is
-    // discarded rather than cached.
+    // Persist only a complete, non-empty crawl: a rate-limited crawl throws
+    // before reaching here, and an empty 200 must not wipe the previous good
+    // crawl the fallback depends on.
+    if (Object.keys(fresh).length === 0) return cached;
     saveCreatedAtCache(fresh, cacheFile);
     return fresh;
   } catch (err) {

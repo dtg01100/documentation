@@ -28,11 +28,9 @@
 !/static/data/scorecard-history.json
 !/static/data/update-churn.json
 !/static/data/update-churn-createdat.json
-// committed next to the churn cache: fetchGhcrTagCreatedAt writes the per-tag
-// build-time sidecar here, and the update-churn-cache workflow `git add`s it
-// explicitly. Without the allow-list the parent `/static/data/*.json` ignore
-// (line 19) discards it, so the sidecar is never committed and the same-day
-// tie-break is lost after a checkout (see #1472).
+# update-churn-createdat.json is the per-tag build-time sidecar written by
+# fetchGhcrTagCreatedAt and committed by the update-churn-cache workflow;
+# without the allow-list above, the /static/data/*.json ignore discards it.
 # github-profiles.json is intentionally gitignored — it is populated at build
 # time by scripts/fetch-github-profiles.js and cached via GHA cache key
 # github-profiles-v1-* (see .github/workflows/update-github-profiles-cache.yml).
