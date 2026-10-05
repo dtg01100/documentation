@@ -13,6 +13,7 @@ const {
   compareTagsByDate,
   selectDatedTags,
   fetchGhcrTagCreatedAt,
+  createdAtCachePath,
   loadCreatedAtCache,
   saveCreatedAtCache,
 } = require("./fetch-update-churn.js");
@@ -501,12 +502,19 @@ function mockFetch(responses) {
 test("loadCreatedAtCache: returns {} for a missing, undated, or stale file", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "churn-createdat-"));
   try {
-    assert.deepEqual(loadCreatedAtCache(path.join(dir, "missing.json")), {});
+    assert.deepEqual(
+      loadCreatedAtCache(
+        "projectbluefin",
+        "utah",
+        path.join(dir, "missing.json"),
+      ),
+      {},
+    );
     const undated = path.join(dir, "undated.json");
     fs.writeFileSync(undated, JSON.stringify({ tags: { a: "b" } }), "utf8");
-    assert.deepEqual(loadCreatedAtCache(undated), {});
+    assert.deepEqual(loadCreatedAtCache("projectbluefin", "utah", undated), {});
     const stale = writeTempCache({ a: "b" }, { ageHours: 200 });
-    assert.deepEqual(loadCreatedAtCache(stale), {});
+    assert.deepEqual(loadCreatedAtCache("projectbluefin", "utah", stale), {});
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -522,7 +530,7 @@ test("loadCreatedAtCache: a cache older than the 24h churn window is still fresh
     { ageHours: 100 },
   );
   try {
-    assert.deepEqual(loadCreatedAtCache(file), {
+    assert.deepEqual(loadCreatedAtCache("projectbluefin", "utah", file), {
       "testing-20261003-ccccccc": "2026-10-03T01:00:00Z",
     });
   } finally {
@@ -536,7 +544,7 @@ test("loadCreatedAtCache: returns {} only past the 7-day sidecar window", () => 
     { ageHours: 200 },
   );
   try {
-    assert.deepEqual(loadCreatedAtCache(file), {});
+    assert.deepEqual(loadCreatedAtCache("projectbluefin", "utah", file), {});
   } finally {
     fs.rmSync(file, { force: true });
   }
@@ -546,7 +554,7 @@ test("loadCreatedAtCache: returns the tags of a fresh cache", () => {
     "testing-20261003-aaaaaaa": "2026-10-03T01:00:00Z",
   });
   try {
-    assert.deepEqual(loadCreatedAtCache(file), {
+    assert.deepEqual(loadCreatedAtCache("projectbluefin", "utah", file), {
       "testing-20261003-aaaaaaa": "2026-10-03T01:00:00Z",
     });
   } finally {
@@ -558,8 +566,8 @@ test("saveCreatedAtCache then loadCreatedAtCache round-trips", () => {
   const file = writeTempCache({});
   try {
     const tags = { "testing-20261003-bbbbbbb": "2026-10-03T02:00:00Z" };
-    saveCreatedAtCache(tags, file);
-    assert.deepEqual(loadCreatedAtCache(file), tags);
+    saveCreatedAtCache("projectbluefin", "utah", tags, file);
+    assert.deepEqual(loadCreatedAtCache("projectbluefin", "utah", file), tags);
   } finally {
     fs.rmSync(file, { force: true });
   }
@@ -674,6 +682,132 @@ test("fetchGhcrTagCreatedAt: an empty successful crawl keeps the previous cache"
   } finally {
     global.fetch = nativeFetch;
     fs.rmSync(file, { force: true });
+    if (savedToken === undefined) delete process.env.GITHUB_TOKEN;
+    else process.env.GITHUB_TOKEN = savedToken;
+  }
+});
+
+// ── per-package sidecar keying (regression-style finding: #1475) ───────────
+// The cache was a single shared path. Only Utah carries a `tagSeries` today,
+// but the design lands a global file now and we would have discovered the
+// collision the day Blueclair or Dakota added one: each run overwrites the
+// other's crawl, and a later failed load returns another package's map. The fix
+// keys the cache by `${org}.${pkg}`. These tests assert the keying.
+
+test("createdAtCachePath: derives a per-package filename under static/data", () => {
+  // The org/package segment is lowercased and URL-encoded so an odd name
+  // (e.g. one with a dot) cannot collide with a sibling's filename or escape
+  // the data directory.
+  assert.equal(
+    createdAtCachePath("projectbluefin", "utah"),
+    path.join(
+      path.join(__dirname, "..", "static", "data"),
+      "update-churn-createdat.projectbluefin.utah.json",
+    ),
+  );
+  assert.equal(
+    createdAtCachePath("ublue-os", "bluefin"),
+    path.join(
+      path.join(__dirname, "..", "static", "data"),
+      "update-churn-createdat.ublue-os.bluefin.json",
+    ),
+  );
+  // Different packages must produce different files (no shared key means no
+  // overwrite). This is the property #1475 asks the design to have.
+  assert.notEqual(
+    createdAtCachePath("projectbluefin", "utah"),
+    createdAtCachePath("projectbluefin", "dakota"),
+    "Utah and Dakota must not share a sidecar file — a second `tagSeries` would otherwise overwrite the other's crawl",
+  );
+  assert.notEqual(
+    createdAtCachePath("ublue-os", "bluefin"),
+    createdAtCachePath("projectbluefin", "bluefin"),
+    "Cross-org same-package names must not share a sidecar file",
+  );
+});
+
+test("loadCreatedAtCache + saveCreatedAtCache: per-package files do not collide (#1475)", () => {
+  // Two packages, two files, no cross-contamination. The old design would
+  // have written both crawls to a single shared file and lost one. The
+  // property we assert is independence: Utah's data is in Utah's file, and
+  // Bluefin's data is in Bluefin's file, and writing one does not touch the
+  // other.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "churn-createdat-"));
+  const utahFile = path.join(
+    dir,
+    "update-churn-createdat.projectbluefin.utah.json",
+  );
+  const bluefinFile = path.join(
+    dir,
+    "update-churn-createdat.ublue-os.bluefin.json",
+  );
+  try {
+    const utahTags = {
+      "testing-20261003-f7c24b2": "2026-10-03T09:41:52Z",
+    };
+    const bluefinTags = {
+      "stable-daily-20261003-aaaaaaa": "2026-10-03T18:00:00Z",
+    };
+    // Write in opposite order from the reads so an implementation that
+    // accidentally overwrites its peer would surface as a stale-tag failure.
+    saveCreatedAtCache("ublue-os", "bluefin", bluefinTags, bluefinFile);
+    saveCreatedAtCache("projectbluefin", "utah", utahTags, utahFile);
+    // Each file holds its own crawl.
+    assert.deepEqual(
+      JSON.parse(fs.readFileSync(utahFile, "utf8")).tags,
+      utahTags,
+    );
+    assert.deepEqual(
+      JSON.parse(fs.readFileSync(bluefinFile, "utf8")).tags,
+      bluefinTags,
+    );
+    // And the API round-trip on each file returns the right crawl.
+    assert.deepEqual(
+      loadCreatedAtCache("projectbluefin", "utah", utahFile),
+      utahTags,
+    );
+    assert.deepEqual(
+      loadCreatedAtCache("ublue-os", "bluefin", bluefinFile),
+      bluefinTags,
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("fetchGhcrTagCreatedAt: a Blueclair crawl does not overwrite Utah's cache (#1475)", async () => {
+  // Regression-style finding from the #1472 review. The design point is: the
+  // same script can fetch multiple `tagSeries` packages in one run, and a
+  // single shared sidecar file would have a Blueclair fetch overwrite Utah's
+  // yesterday. Here Utah is cached and Blueclair fails; Utah's cache must
+  // survive, and Blueclair's own cache (if a successful run had happened
+  // before) must not have leaked into this one.
+  const savedToken = process.env.GITHUB_TOKEN;
+  process.env.GITHUB_TOKEN = "test-token";
+  const utahFile = writeTempCache({
+    "testing-20261003-f7c24b2": "2026-10-03T09:41:52Z",
+  });
+  // Distinct directory so a regression to a shared path is observable.
+  const bluefinDir = fs.mkdtempSync(path.join(os.tmpdir(), "churn-bluefin-"));
+  const bluefinFile = path.join(
+    bluefinDir,
+    "update-churn-createdat.ublue-os.bluefin.json",
+  );
+  mockFetch(() => ({ status: 403, body: [] }));
+  try {
+    // A failed Blueclair crawl must not touch Utah's file at all.
+    await fetchGhcrTagCreatedAt("ublue-os", "bluefin", bluefinFile);
+    assert.deepEqual(
+      loadCreatedAtCache("projectbluefin", "utah", utahFile),
+      { "testing-20261003-f7c24b2": "2026-10-03T09:41:52Z" },
+      "Utah's sidecar must survive an unrelated Blueclair API failure",
+    );
+    // The Blueclair file was not created (no successful crawl to write).
+    assert.equal(fs.existsSync(bluefinFile), false);
+  } finally {
+    global.fetch = nativeFetch;
+    fs.rmSync(utahFile, { force: true });
+    fs.rmSync(bluefinDir, { recursive: true, force: true });
     if (savedToken === undefined) delete process.env.GITHUB_TOKEN;
     else process.env.GITHUB_TOKEN = savedToken;
   }

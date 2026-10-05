@@ -27,10 +27,13 @@
 !/static/data/countme-history.json
 !/static/data/scorecard-history.json
 !/static/data/update-churn.json
-!/static/data/update-churn-createdat.json
-# update-churn-createdat.json is the per-tag build-time sidecar written by
-# fetchGhcrTagCreatedAt and committed by the update-churn-cache workflow;
-# without the allow-list above, the /static/data/*.json ignore discards it.
+!/static/data/update-churn-createdat.*.json
+# update-churn-createdat.{org}.{pid}.json is the per-tag build-time sidecar
+# written by fetchGhcrTagCreatedAt and committed by the update-churn-cache
+# workflow; without the allow-list above, the /static/data/*.json ignore
+# discards it. The filename is keyed by org/package so a Blueclair crawl does
+# not overwrite Utah's yesterday (regression-style finding from the #1472
+# review).
 # github-profiles.json is intentionally gitignored — it is populated at build
 # time by scripts/fetch-github-profiles.js and cached via GHA cache key
 # github-profiles-v1-* (see .github/workflows/update-github-profiles-cache.yml).

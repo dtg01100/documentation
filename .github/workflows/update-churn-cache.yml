@@ -68,9 +68,11 @@ jobs:
           # Persist the build-time sidecar cache so a rate-limited run next day
           # falls back to yesterday's ordering instead of flapping to tag text
           # (#1471). Only the churn payload drives change detection above, so
-          # this is staged here, not in the check-changes step.
-          if [ -f static/data/update-churn-createdat.json ]; then
-            git add static/data/update-churn-createdat.json
+          # this is staged here, not in the check-changes step. The sidecar is
+          # keyed by `${org}.${pkg}` so each package gets its own file (#1475);
+          # add whatever the run produced rather than a single named path.
+          if compgen -G "static/data/update-churn-createdat.*.json" > /dev/null; then
+            git add static/data/update-churn-createdat.*.json
           fi
           git checkout -b "$BRANCH"
           git commit -m "chore(analytics): update release churn statistics"

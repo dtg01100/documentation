@@ -44,22 +44,45 @@ const OUTPUT_FILE = path.join(
  * whole same-day chain falls back to non-chronological tag-text order. Keeping
  * the previous complete crawl lets a flaky run degrade to yesterday's ordering
  * instead of flapping run-to-run.
+ *
+ * Keyed by `${org}.${pkg}` so each package gets its own file. Only Utah has a
+ * `tagSeries` today, so a global path is fine in practice, but adding Bluefin
+ * Classic or Dakota as a series would have each run overwrite the other's
+ * crawl and `loadCreatedAtCache` would return another package's map on a
+ * subsequent failure (style finding from the #1472 review).
  */
-const CREATED_AT_CACHE_FILE = path.join(
-  __dirname,
-  "..",
-  "static",
-  "data",
-  "update-churn-createdat.json",
-);
+const CREATED_AT_CACHE_DIR = path.join(__dirname, "..", "static", "data");
+
+/**
+ * Build the per-package sidecar cache path. The `{org}.{pkg}` segment is the
+ * GHCR org and package name; encoding the segment keeps `/` from forming a new
+ * directory entry on any future package whose name carries an unusual char.
+ *
+ * @param {string} org
+ * @param {string} pkg
+ * @returns {string}
+ */
+function createdAtCachePath(org, pkg) {
+  const safeOrg = encodeURIComponent(String(org || "").toLowerCase());
+  const safePkg = encodeURIComponent(String(pkg || "").toLowerCase());
+  return path.join(
+    CREATED_AT_CACHE_DIR,
+    `update-churn-createdat.${safeOrg}.${safePkg}.json`,
+  );
+}
 
 /**
  * Read the build-time sidecar cache. Returns `{}` when the file is missing,
  * unreadable, undated, or older than the cache window — all of which mean
  * "no reliable build times". Aged by the payload's own `generatedAt`, the same
  * checkout-proof signal `seed-cache.js` uses for the other committed seeds.
+ *
+ * @param {string} org
+ * @param {string} pkg
+ * @param {string} [file] override path, used by tests
+ * @returns {Record<string, string>}
  */
-function loadCreatedAtCache(file = CREATED_AT_CACHE_FILE) {
+function loadCreatedAtCache(org, pkg, file = createdAtCachePath(org, pkg)) {
   try {
     const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
     const stamp = Date.parse(parsed?.generatedAt ?? "");
@@ -83,8 +106,18 @@ function loadCreatedAtCache(file = CREATED_AT_CACHE_FILE) {
  * crawls are written: a partial snapshot would mix build-time and tag-text
  * ordering on a later run, so a rate-limited crawl is discarded rather than
  * cached.
+ *
+ * @param {string} org
+ * @param {string} pkg
+ * @param {Record<string, string>} map
+ * @param {string} [file] override path, used by tests
  */
-function saveCreatedAtCache(map, file = CREATED_AT_CACHE_FILE) {
+function saveCreatedAtCache(
+  org,
+  pkg,
+  map,
+  file = createdAtCachePath(org, pkg),
+) {
   try {
     fs.writeFileSync(
       file,
@@ -501,18 +534,22 @@ async function getPlatformLayers(repo, tag) {
  *
  * Returns a tag -> build-time map — never throws — when the API is
  * unreachable, unauthenticated or rate-limited. On failure it falls back to
- * the previous complete crawl (see `CREATED_AT_CACHE_FILE`), so `compareTagsByDate`
+ * the previous complete crawl (see `loadCreatedAtCache`), so `compareTagsByDate`
  * keeps ordering same-day tags by build time instead of flapping to non-chrono-
  * logical tag text run-to-run. Only a missing token or a never-run cache yields
- * `{}`, and then it degrades to tag text as a documented approximation.
+ * `{}`, and then it degrades to tag text as a documented approximation. The
+ * cache file is keyed by `${org}.${pkg}` so each package's crawl survives
+ * independently — a Blueclair run can no longer overwrite Utah's yesterday's
+ * crawl, and a failed Blueclair load returns Blueclair's last good crawl, not
+ * Utah's (#1475 style finding).
  *
- * @param {string} [cacheFile] sidecar cache path, overridable for tests
+ * @param {string} [cacheFile] override path, used by tests to point load/save at a temp file
  * @returns {Promise<Record<string, string>>} tag -> ISO 8601 build timestamp
  */
 async function fetchGhcrTagCreatedAt(
   org,
   pkg,
-  cacheFile = CREATED_AT_CACHE_FILE,
+  cacheFile = createdAtCachePath(org, pkg),
 ) {
   const token = githubToken();
   if (!token) {
@@ -532,7 +569,10 @@ async function fetchGhcrTagCreatedAt(
   // per-hour limit and an all-or-nothing contract here: a rate-limited run
   // used to return {} and the whole same-day chain fell back to tag text,
   // flapping run-to-run. Yesterday's build times keep the chain chronological.
-  const cached = loadCreatedAtCache(cacheFile);
+  // The cache is keyed by org/pkg so each package keeps its own crawl — a
+  // single global file would let a Blueclair crawl wipe Utah's yesterday
+  // (#1475).
+  const cached = loadCreatedAtCache(org, pkg, cacheFile);
 
   const headers = {
     Authorization: `Bearer ${token}`,
@@ -577,7 +617,7 @@ async function fetchGhcrTagCreatedAt(
     // before reaching here, and an empty 200 must not wipe the previous good
     // crawl the fallback depends on.
     if (Object.keys(fresh).length === 0) return cached;
-    saveCreatedAtCache(fresh, cacheFile);
+    saveCreatedAtCache(org, pkg, fresh, cacheFile);
     return fresh;
   } catch (err) {
     console.warn(
@@ -800,6 +840,7 @@ async function main() {
 module.exports = {
   OUTPUT_FILE,
   SBOM_FILE,
+  CREATED_AT_CACHE_DIR,
   CACHE_MAX_AGE_HOURS,
   CREATED_AT_CACHE_MAX_HOURS,
   IMAGE_CONFIGS,
@@ -811,6 +852,7 @@ module.exports = {
   selectDatedTags,
   discoverSeriesTags,
   fetchGhcrTagCreatedAt,
+  createdAtCachePath,
   loadCreatedAtCache,
   saveCreatedAtCache,
   extractDateFromTag,
